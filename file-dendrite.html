@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>dendrite — radial filesystem dendrogram</title>
+<!--
+ARCHITECTURE
+============
+Deterministic circular dendrogram of a directory tree, with a pointer-following
+fisheye lens. No physics — layout is a pure function of the tree.
+
+1. INGEST  <input webkitdirectory> yields every file's relative path + size.
+   Nothing uploads; it's a listing. buildTree() folds paths into a node tree,
+   aggregating size + leaf counts bottom-up.
+
+2. LAYOUT (dendrogram)  layout() walks the *visible* tree (honoring collapse,
+   max-depth, and a per-folder child cap that folds extras into a "+N more" node):
+     • leaves get evenly-spaced angular slots around the full circle
+     • tips are ALIGNED to the outer ring (radius = maxDepth·gap), like an
+       ultrametric cladogram — this is what gives the clean outer circle
+     • internal nodes sit on their depth ring, angle = midpoint of descendant slots
+   Each edge parent→child is drawn as an ARC (at parent radius, parent→child
+   angle) then a RADIAL spoke (child angle, parent→child radius) — the orthogonal
+   "elbow" that defines the ggtree look.
+
+3. FISHEYE LENS  Sarkar–Brown radial magnification in screen space around the
+   cursor: a point at screen-distance r from the focus (r<R) maps to
+   R·((d+1)x)/(dx+1), x=r/R, giving (d+1)× magnification at the focus decaying to
+   1× at the rim. Every edge is tessellated and every vertex passes through the
+   lens, so arcs/spokes bend smoothly; dot + label size scale by the local
+   magnification, so whatever you hover swells into legibility. Focus eases toward
+   the cursor for a smooth feel.
+
+Decisions:
+ - Aligned tips (not depth-radius): matches the reference's clean outer circle and
+   naturally draws long lonely branches for shallow files, like divergent taxa.
+ - Colormap interpolates the scalar (log size) then maps to a red→blue spectrum,
+   so branches show a smooth gradient like the reference's trait coloring.
+ - No localStorage (artifact constraint). Canvas 2D (fast enough with node caps).
+-->
+<style>
+  :root{
+    --bg:#090c11; --panel:rgba(13,17,24,.9); --line:#222a37; --ink:#c8d2e0;
+    --dim:#5b6a7e; --accent:#e8b04b;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;overflow:hidden;background:var(--bg)}
+  body{font-family:ui-monospace,"SF Mono","Cascadia Mono","JetBrains Mono",Menlo,Consolas,monospace;color:var(--ink);font-size:12px}
+  #cv{position:absolute;inset:0;display:block;cursor:crosshair}
+  #cv.pan{cursor:grabbing}
+
+  .hud{position:absolute;top:14px;left:14px;width:250px;background:var(--panel);
+       border:1px solid var(--line);backdrop-filter:blur(8px);padding:14px 14px 12px;user-select:none}
+  .hud h1{font-size:13px;font-weight:600;letter-spacing:.18em;text-transform:uppercase}
+  .hud h1 span{color:var(--accent)}
+  .hud .sub{color:var(--dim);margin-top:3px;font-size:10.5px;line-height:1.45}
+
+  .btn{display:block;width:100%;margin-top:12px;background:none;border:1px solid var(--accent);
+       color:var(--accent);font:inherit;letter-spacing:.1em;text-transform:uppercase;padding:8px 0;
+       cursor:pointer;transition:background .15s,color .15s}
+  .btn:hover,.btn:focus-visible{background:var(--accent);color:#090c11;outline:none}
+  .btn.sec{border-color:var(--line);color:var(--dim);margin-top:6px;padding:5px 0;font-size:10.5px}
+  .btn.sec:hover{background:var(--line);color:var(--ink)}
+
+  .stats{margin-top:12px;border-top:1px solid var(--line);padding-top:10px;
+         display:grid;grid-template-columns:1fr auto;row-gap:3px;font-size:11px}
+  .stats .k{color:var(--dim)} .stats .v{text-align:right;font-variant-numeric:tabular-nums}
+
+  .ctl{margin-top:10px;border-top:1px solid var(--line);padding-top:10px}
+  .ctl label{display:flex;justify-content:space-between;color:var(--dim);font-size:10.5px;margin-top:7px}
+  .ctl label:first-child{margin-top:0} .ctl output{color:var(--ink)}
+  input[type=range]{width:100%;height:14px;-webkit-appearance:none;background:transparent;cursor:pointer}
+  input[type=range]::-webkit-slider-runnable-track{height:2px;background:var(--line)}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:9px;height:9px;margin-top:-3.5px;background:var(--ink)}
+  input[type=range]::-moz-range-track{height:2px;background:var(--line)}
+  input[type=range]::-moz-range-thumb{width:9px;height:9px;background:var(--ink);border:0}
+
+  .seg{display:flex;margin-top:10px;border:1px solid var(--line)}
+  .seg button{flex:1;background:none;border:0;color:var(--dim);font:inherit;font-size:10.5px;
+              padding:5px 0;cursor:pointer;letter-spacing:.06em;text-transform:uppercase}
+  .seg button.on{background:var(--line);color:var(--ink)}
+
+  input[type=search]{width:100%;margin-top:10px;background:#0c1017;border:1px solid var(--line);
+                     color:var(--ink);font:inherit;padding:6px 8px}
+  input[type=search]::placeholder{color:var(--dim)}
+  input[type=search]:focus{outline:none;border-color:var(--dim)}
+
+  .legend{margin-top:10px;border-top:1px solid var(--line);padding-top:9px;font-size:10.5px;color:var(--dim)}
+  #barWrap{margin-top:6px}
+  #bar{height:9px;width:100%;border:1px solid var(--line);
+       background:linear-gradient(90deg,hsl(240,68%,54%),hsl(180,68%,54%),hsl(120,60%,50%),hsl(60,72%,52%),hsl(0,72%,54%))}
+  .barlbl{display:flex;justify-content:space-between;margin-top:3px;font-variant-numeric:tabular-nums}
+  #cats{display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;margin-top:4px}
+  #cats i{display:inline-block;width:8px;height:8px;margin-right:6px;vertical-align:-1px}
+
+  #tip{position:absolute;pointer-events:none;display:none;background:var(--panel);
+       border:1px solid var(--line);padding:8px 10px;max-width:340px;font-size:11px;line-height:1.5;z-index:5}
+  #tip .n{font-weight:600;word-break:break-all}
+  #tip .p{color:var(--dim);word-break:break-all}
+  #tip .m{color:var(--accent);margin-top:2px}
+
+  #hint{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);color:var(--dim);
+        font-size:10.5px;letter-spacing:.06em;background:var(--panel);border:1px solid var(--line);
+        padding:5px 12px;user-select:none;white-space:nowrap}
+  @media (max-width:640px){.hud{width:calc(100% - 28px)}#hint{display:none}}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+
+<div class="hud">
+  <h1>den<span>/</span>drite</h1>
+  <div class="sub">radial dendrogram of a folder · tips on the outer ring · lens magnifies wherever you point · nothing leaves your machine.</div>
+
+  <button class="btn" id="pick">Choose folder</button>
+  <input type="file" id="dir" webkitdirectory multiple hidden>
+  <button class="btn sec" id="demo">Load demo tree</button>
+
+  <div class="stats">
+    <span class="k">files</span><span class="v" id="sFiles">–</span>
+    <span class="k">folders</span><span class="v" id="sDirs">–</span>
+    <span class="k">total size</span><span class="v" id="sSize">–</span>
+    <span class="k">shown</span><span class="v" id="sShown">–</span>
+  </div>
+
+  <div class="seg" id="colorSeg">
+    <button data-c="size" class="on">size</button>
+    <button data-c="type">type</button>
+  </div>
+
+  <input type="search" id="q" placeholder="filter by name…" spellcheck="false">
+
+  <div class="ctl">
+    <label>lens magnify <output id="oMag">4.0</output></label>
+    <input type="range" id="rMag" min="0" max="8" step="0.5" value="4">
+    <label>lens size <output id="oR">240</output></label>
+    <input type="range" id="rR" min="120" max="440" value="240">
+    <label>max depth <output id="oDep">7</output></label>
+    <input type="range" id="rDep" min="2" max="11" value="7">
+  </div>
+
+  <div class="legend">
+    <span id="legTitle">branch color = file size</span>
+    <div id="barWrap">
+      <div id="bar"></div>
+      <div class="barlbl"><span id="barMin">–</span><span id="barMax">–</span></div>
+    </div>
+    <div id="cats" style="display:none"></div>
+  </div>
+</div>
+
+<div id="tip"></div>
+<div id="hint">move to magnify · scroll zoom · drag pan · click folder to fold</div>
+
+<script>
+"use strict";
+
+/* ---------- constants ---------- */
+const MAX_CHILDREN = 40;
+const MAX_NODES    = 6500;
+const RING_GAP     = 100;      // world units between depth rings
+const CAT = {
+  folder:"#e8b04b", code:"#5fd4c4", media:"#d670b8", audio:"#9d7bf0",
+  doc:"#7ea8e8", data:"#a3c96a", archive:"#e07a5f", other:"#6b7688", agg:"#3a4353"
+};
+const CAT_LABEL = { folder:"folder", code:"code", media:"image·video", audio:"audio",
+  doc:"docs", data:"data", archive:"archive", other:"other" };
+const EXT = (()=>{const m={};const a=(c,l)=>l.forEach(e=>m[e]=c);
+  a("code",["js","ts","jsx","tsx","rs","py","c","h","cpp","hpp","cc","go","java","kt","swift","rb","php","sh","bash","zsh","lua","sql","html","css","scss","vue","svelte","toml","nix","cmake","asm","glsl","wgsl","frag","vert","ipynb","r","jl","zig","ex","hs","ml","clj"]);
+  a("media",["png","jpg","jpeg","gif","webp","svg","bmp","tiff","tif","ico","heic","raw","psd","ai","mp4","mkv","mov","avi","webm","m4v","flv"]);
+  a("audio",["mp3","wav","flac","ogg","m4a","aac","aiff","mid","midi","opus","wma"]);
+  a("doc",["md","txt","pdf","doc","docx","rtf","odt","tex","epub","mobi","ppt","pptx","pages","org","rst","log"]);
+  a("data",["json","csv","tsv","xml","yaml","yml","parquet","db","sqlite","sqlite3","xls","xlsx","h5","npy","npz","pkl","pt","pth","onnx","safetensors","gguf","bin","dat","cfg","ini","env","lock","step","stl","stp"]);
+  a("archive",["zip","tar","gz","bz2","xz","7z","rar","zst","dmg","iso","deb","rpm","appimage","apk","jar","whl"]);
+  return m;})();
+
+/* ---------- state ---------- */
+let rootData=null, nodes=[], edges=[];
+let cam={x:0,y:0,k:1};
+let params={mag:4, R:240, depth:7};
+let colorMode="size";
+let vMin=0, vMax=1;               // normalized value range (log size) for legend
+let query="", hoverNode=null;
+const collapsed=new Set();        // paths of collapsed folders
+let lens={x:0,y:0,tx:0,ty:0,on:false,str:0};
+
+const cv=document.getElementById("cv");
+const ctx=cv.getContext("2d");
+const tip=document.getElementById("tip");
+const prefersRM=matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* ---------- ingest ---------- */
+function newDir(name){return{name,isDir:true,children:[],map:new Map(),size:0,leaf:0}}
+function buildTree(list){
+  let root=null;
+  for(const f of list){
+    const parts=f.path.split("/").filter(Boolean);
+    if(!parts.length)continue;
+    if(!root)root=newDir(parts[0]);
+    let cur=root;
+    for(let i=1;i<parts.length;i++){
+      const leaf=i===parts.length-1, nm=parts[i];
+      if(leaf){cur.children.push({name:nm,isDir:false,size:f.size});}
+      else{let nx=cur.map.get(nm);if(!nx){nx=newDir(nm);cur.map.set(nm,nx);cur.children.push(nx);}cur=nx;}
+    }
+  }
+  if(!root)return null;
+  (function agg(n){
+    if(!n.isDir){n.leaf=1;return n.size;}
+    n.size=0;n.leaf=0;
+    for(const c of n.children){n.size+=agg(c);n.leaf+=c.leaf;}
+    n.leaf=Math.max(1,n.leaf);return n.size;
+  })(root);
+  return root;
+}
+
+/* ---------- category / value ---------- */
+function categoryOf(d){
+  if(d.agg)return"agg"; if(d.isDir)return"folder";
+  const i=d.name.lastIndexOf("."); const e=i>0?d.name.slice(i+1).toLowerCase():"";
+  return EXT[e]||"other";
+}
+const valueOf=d=>Math.log10((d.size||0)+1);
+
+/* ---------- dendrogram layout ---------- */
+function layout(){
+  if(!rootData)return;
+  nodes=[]; edges=[];
+  let budget=MAX_NODES, nextLeaf=0;
+
+  // Pass 1: build visible node objects, assign leaf slots (order = DFS).
+  function build(data, parent, path, depth){
+    if(budget--<=0)return null;
+    const n={data,parent,path,depth,isDir:data.isDir,agg:!!data.agg,
+             aggCount:data.aggCount||0,children:[],slotMin:0,slotMax:0,angle:0,radius:0};
+    nodes.push(n);
+    const expandable = data.isDir && !collapsed.has(path) && depth<params.depth;
+    if(expandable){
+      let kids=data.children;
+      if(kids.length>MAX_CHILDREN){
+        kids=[...kids].sort((a,b)=>b.size-a.size||b.leaf-a.leaf);
+        const extra=kids.slice(MAX_CHILDREN-1); kids=kids.slice(0,MAX_CHILDREN-1);
+        kids.push({name:"+"+extra.length+" more",isDir:false,agg:true,aggCount:extra.length,
+                   size:extra.reduce((s,c)=>s+c.size,0),
+                   leaf:Math.max(1,extra.reduce((s,c)=>s+c.leaf,0))});
+      }
+      for(const c of kids){
+        const child=build(c,n,path+"/"+c.name,depth+1);
+        if(child)n.children.push(child);
+      }
+    }
+    if(!n.children.length){ n.slotMin=n.slotMax=nextLeaf++; }        // a visible leaf
+    else{ n.slotMin=n.children[0].slotMin; n.slotMax=n.children[n.children.length-1].slotMax; }
+    return n;
+  }
+  const root=build(rootData,null,rootData.name,0);
+  const L=Math.max(1,nextLeaf);
+  const maxDepth=nodes.reduce((m,n)=>Math.max(m,n.depth),0);
+  const rimR=Math.max(1,maxDepth)*RING_GAP;
+
+  // Pass 2: polar coords. Angle from slot midpoint; tips aligned to rim.
+  const slotAngle=s=>(-Math.PI/2)+((s+0.5)/L)*Math.PI*2;
+  let lo=Infinity,hi=-Infinity;
+  for(const n of nodes){
+    n.angle=slotAngle((n.slotMin+n.slotMax)/2);
+    const isLeaf=!n.children.length;
+    n.radius=isLeaf?rimR:(n.depth*RING_GAP);
+    n.wx=Math.cos(n.angle)*n.radius; n.wy=Math.sin(n.angle)*n.radius;
+    n.cat=categoryOf(n.agg?n.data:n.data);
+    n.value=valueOf(n.data);
+    lo=Math.min(lo,n.value); hi=Math.max(hi,n.value);
+    n.dot=n.isDir?(3+Math.min(6,Math.log10(1+n.data.leaf)*1.9))
+                 :(1.8+Math.min(5,Math.max(0,Math.log10(1+(n.data.size||0))-1.6)*0.8));
+    if(n.agg)n.dot=2.6+Math.min(3.5,Math.log10(1+n.aggCount));
+  }
+  vMin=lo; vMax=Math.max(hi,lo+1e-6);
+  if(root){root.wx=0;root.wy=0;root.radius=0;}
+  // normalize values
+  for(const n of nodes) n.v01=(n.value-vMin)/(vMax-vMin);
+  // edges list
+  for(const n of nodes) if(n.parent) edges.push(n);
+  applyQuery();
+  updateStats(maxDepth);
+  updateLegend();
+}
+
+/* ---------- fisheye + camera ---------- */
+const cxv=()=>innerWidth/2, cyv=()=>innerHeight/2;
+function proj0(wx,wy){ return [cxv()+(wx-cam.x)*cam.k, cyv()+(wy-cam.y)*cam.k]; }
+function project(wx,wy){
+  let sx=cxv()+(wx-cam.x)*cam.k, sy=cyv()+(wy-cam.y)*cam.k;
+  if(lens.str>0){
+    const d=params.mag*lens.str; if(d>0){
+      const dx=sx-lens.x, dy=sy-lens.y, r=Math.hypot(dx,dy);
+      if(r>1e-4&&r<params.R){ const x=r/params.R; const g=((d+1)*x)/(d*x+1);
+        const f=(params.R*g)/r; sx=lens.x+dx*f; sy=lens.y+dy*f; }
+    }
+  }
+  return [sx,sy];
+}
+function scaleAt(bx,by){
+  if(lens.str<=0)return 1; const d=params.mag*lens.str; if(d<=0)return 1;
+  const r=Math.hypot(bx-lens.x,by-lens.y); if(r>=params.R)return 1;
+  const x=r/params.R; return (d+1)/((d*x+1)*(d*x+1));
+}
+
+/* ---------- color ---------- */
+function sizeColor(v01,a){ const h=(1-clamp01(v01))*240; return `hsla(${h},68%,54%,${a==null?1:a})`; }
+function edgeColorSolid(n,a){ return colorMode==="size"?sizeColor(n.v01,a):hexA(CAT[n.cat],a==null?1:a); }
+function clamp01(x){return x<0?0:x>1?1:x;}
+function hexA(hex,a){ const n=parseInt(hex.slice(1),16); return `rgba(${n>>16&255},${n>>8&255},${n&255},${a})`; }
+
+/* ---------- render ---------- */
+function resize(){
+  const dpr=Math.min(2,devicePixelRatio||1);
+  cv.width=innerWidth*dpr; cv.height=innerHeight*dpr;
+  cv.style.width=innerWidth+"px"; cv.style.height=innerHeight+"px";
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+addEventListener("resize",resize);
+
+function drawEdge(n){
+  const p=n.parent;
+  const dim = query && !n.match && !n.subMatch;
+  const nearL = lens.str>0 && (
+    dist2ToLens(p._bx,p._by)<(params.R*1.5)**2 || dist2ToLens(n._bx,n._by)<(params.R*1.5)**2);
+  const baseA = dim?0.09:(n.isDir?0.75:0.5);
+  const lw = Math.max(.5,(n.isDir?1.5:0.9)*Math.min(1.6,cam.k));
+
+  // ARC at parent radius, parent.angle -> child.angle (parent color)
+  let a0=p.angle, a1=n.angle, span=a1-a0;
+  if(Math.abs(span)>1e-4 && p.radius>1e-3){
+    const pxLen=Math.abs(span)*p.radius*cam.k;
+    let segs=Math.min(44,Math.max(2,Math.ceil(pxLen/14))); if(nearL)segs=Math.max(segs,12);
+    ctx.strokeStyle=edgeColorSolid(p,baseA); ctx.lineWidth=lw; ctx.beginPath();
+    for(let i=0;i<=segs;i++){
+      const a=a0+span*i/segs; const [sx,sy]=project(Math.cos(a)*p.radius,Math.sin(a)*p.radius);
+      i?ctx.lineTo(sx,sy):ctx.moveTo(sx,sy);
+    }
+    ctx.stroke();
+  }
+  // RADIAL spoke at child.angle, parent.radius -> child.radius (gradient parent->child)
+  const ca=n.angle, r0=p.radius, r1=n.radius, dr=r1-r0;
+  const pxLen=Math.abs(dr)*cam.k;
+  let segs=Math.min(28,Math.max(1,Math.ceil(pxLen/16))); if(nearL)segs=Math.max(segs,10);
+  const cs=Math.cos(ca), sn=Math.sin(ca);
+  let prev=project(cs*r0,sn*r0);
+  for(let i=1;i<=segs;i++){
+    const t=i/segs; const r=r0+dr*t;
+    const cur=project(cs*r,sn*r);
+    if(colorMode==="size"){ const v=p.v01+(n.v01-p.v01)*t; ctx.strokeStyle=sizeColor(v,dim?0.09:0.85); }
+    else ctx.strokeStyle=edgeColorSolid(n,baseA);
+    ctx.lineWidth=lw; ctx.beginPath(); ctx.moveTo(prev[0],prev[1]); ctx.lineTo(cur[0],cur[1]); ctx.stroke();
+    prev=cur;
+  }
+}
+
+function draw(){
+  ctx.clearRect(0,0,innerWidth,innerHeight);
+
+  // faint depth rings
+  const [ox,oy]=proj0(0,0);
+  ctx.strokeStyle="rgba(120,140,170,.05)"; ctx.lineWidth=1;
+  for(let d=1;d<=params.depth;d++){ const rr=d*RING_GAP*cam.k;
+    if(rr<4||rr>Math.hypot(innerWidth,innerHeight))continue;
+    ctx.beginPath(); ctx.arc(ox,oy,rr,0,Math.PI*2); ctx.stroke(); }
+
+  // cache base screen positions for lens proximity + sizing
+  for(const n of nodes){ const b=proj0(n.wx,n.wy); n._bx=b[0]; n._by=b[1]; n._sc=scaleAt(b[0],b[1]); }
+
+  ctx.lineCap="round"; ctx.lineJoin="round";
+  for(const n of edges) drawEdge(n);
+
+  // nodes
+  const showAllLabels = cam.k*RING_GAP>150;
+  for(const n of nodes){
+    const [sx,sy]=project(n.wx,n.wy);
+    if(sx<-40||sx>innerWidth+40||sy<-40||sy>innerHeight+40)continue;
+    const sc=Math.min(3.5,Math.max(.5,Math.sqrt(n._sc)));
+    const r=Math.max(1,n.dot*sc*Math.min(2,Math.max(.6,cam.k)));
+    const dim=query&&!n.match;
+    ctx.globalAlpha=dim?0.15:1;
+    ctx.beginPath(); ctx.arc(sx,sy,r,0,Math.PI*2);
+    if(n.isDir){ ctx.fillStyle=colorMode==="size"?sizeColor(n.v01):CAT.folder; ctx.fill();
+      if(collapsed.has(n.path)){ ctx.strokeStyle="#fff"; ctx.lineWidth=1; ctx.stroke(); } }
+    else { ctx.fillStyle=colorMode==="size"?sizeColor(n.v01):CAT[n.cat]; ctx.fill(); }
+    if(n===hoverNode){ ctx.beginPath(); ctx.arc(sx,sy,r+4,0,Math.PI*2);
+      ctx.strokeStyle="rgba(255,255,255,.8)"; ctx.lineWidth=1; ctx.stroke(); }
+    ctx.globalAlpha=1;
+
+    // labels: near lens (magnified), or when zoomed in, or forced for hover / matches
+    const wantLabel = n===hoverNode || (query&&n.match) || n._sc>2.0 || (showAllLabels&&(n.isDir||n._sc>1.2));
+    if(wantLabel){
+      const fs=Math.max(9,Math.min(16, (n.isDir?11:10)*Math.min(1.8,Math.max(1,n._sc*0.6))));
+      const flip=Math.cos(n.angle)<0;
+      ctx.save(); ctx.translate(sx,sy); ctx.rotate(flip?n.angle+Math.PI:n.angle);
+      ctx.font=(n.isDir?"600 ":"")+fs+"px ui-monospace,Menlo,Consolas,monospace";
+      ctx.textAlign=flip?"right":"left"; ctx.textBaseline="middle";
+      ctx.fillStyle=dim?"rgba(160,175,195,.2)":(n.isDir?"rgba(232,220,190,.95)":"rgba(200,212,224,.9)");
+      const off=(flip?-1:1)*(r+5);
+      ctx.fillText(n.data.name, off, 0);
+      ctx.restore();
+    }
+  }
+}
+function dist2ToLens(x,y){ const dx=x-lens.x,dy=y-lens.y; return dx*dx+dy*dy; }
+
+function frame(){
+  // ease lens focus + strength
+  const ease=prefersRM?1:0.28;
+  lens.x+=(lens.tx-lens.x)*ease; lens.y+=(lens.ty-lens.y)*ease;
+  const target=lens.on?1:0; lens.str+=(target-lens.str)*(prefersRM?1:0.2);
+  if(lens.str<0.002)lens.str=0;
+  draw();
+  requestAnimationFrame(frame);
+}
+
+/* ---------- interaction ---------- */
+let panning=false,downNode=null,lastX=0,lastY=0,moved=0;
+function pick(sx,sy){
+  let best=null,bd=Infinity;
+  for(const n of nodes){ const dx=n._bx-sx, dy=n._by-sy, d2=dx*dx+dy*dy;
+    const rr=(n.dot*Math.max(1,n._sc)+7)**2;
+    if(d2<rr&&d2<bd){bd=d2;best=n;} }
+  return best;
+}
+cv.addEventListener("pointerdown",e=>{
+  cv.setPointerCapture(e.pointerId); lastX=e.clientX; lastY=e.clientY; moved=0;
+  downNode=pick(e.clientX,e.clientY); panning=true; cv.classList.add("pan");
+});
+cv.addEventListener("pointermove",e=>{
+  lens.tx=e.clientX; lens.ty=e.clientY; lens.on=true;
+  const dx=e.clientX-lastX, dy=e.clientY-lastY;
+  if(panning){ moved+=Math.abs(dx)+Math.abs(dy);
+    if(moved>4){ cam.x-=dx/cam.k; cam.y-=dy/cam.k; } }
+  else{ const h=pick(e.clientX,e.clientY); if(h!==hoverNode){hoverNode=h;updateTip(e.clientX,e.clientY);} else if(h)placeTip(e.clientX,e.clientY); }
+  lastX=e.clientX; lastY=e.clientY;
+});
+cv.addEventListener("pointerup",e=>{
+  cv.classList.remove("pan");
+  if(downNode&&moved<5&&downNode.isDir&&!downNode.agg){
+    if(collapsed.has(downNode.path))collapsed.delete(downNode.path);
+    else collapsed.add(downNode.path);
+    layout();
+  }
+  panning=false; downNode=null;
+});
+cv.addEventListener("pointerleave",()=>{lens.on=false;hoverNode=null;tip.style.display="none";});
+cv.addEventListener("wheel",e=>{
+  e.preventDefault();
+  const k0=cam.k, k1=Math.min(14,Math.max(.03,k0*Math.exp(-e.deltaY*0.0016)));
+  const wx=(e.clientX-cxv())/k0+cam.x, wy=(e.clientY-cyv())/k0+cam.y;
+  cam.k=k1; cam.x=wx-(e.clientX-cxv())/k1; cam.y=wy-(e.clientY-cyv())/k1;
+},{passive:false});
+
+/* ---------- tooltip ---------- */
+function updateTip(sx,sy){
+  if(!hoverNode){tip.style.display="none";return;}
+  const n=hoverNode, kind=n.agg?"aggregated":n.isDir?"folder":CAT_LABEL[n.cat]||n.cat;
+  tip.innerHTML='<div class="n">'+esc(n.data.name)+'</div><div class="p">'+esc(n.path)+
+    '</div><div class="m">'+kind+' · '+fmtSize(n.data.size)+
+    (n.isDir?' · '+n.data.leaf.toLocaleString()+' files':'')+
+    (n.agg?' · '+n.aggCount+' folded':'')+'</div>';
+  tip.style.display="block"; placeTip(sx,sy);
+}
+function placeTip(sx,sy){ const w=tip.offsetWidth,h=tip.offsetHeight;
+  tip.style.left=Math.min(innerWidth-w-8,sx+16)+"px"; tip.style.top=Math.min(innerHeight-h-8,sy+16)+"px"; }
+
+/* ---------- helpers ---------- */
+function esc(s){const d=document.createElement("div");d.textContent=s;return d.innerHTML;}
+function fmtSize(b){ if(b==null)return"–"; const u=["B","KB","MB","GB","TB"];let i=0;
+  while(b>=1024&&i<u.length-1){b/=1024;i++;} return (b>=100||i===0?Math.round(b):b.toFixed(1))+" "+u[i]; }
+function updateStats(maxDepth){
+  let dirs=0; (function c(n){if(n.isDir){dirs++;n.children.forEach(c);}})(rootData);
+  document.getElementById("sFiles").textContent=rootData.leaf.toLocaleString();
+  document.getElementById("sDirs").textContent=dirs.toLocaleString();
+  document.getElementById("sSize").textContent=fmtSize(rootData.size);
+  document.getElementById("sShown").textContent=nodes.length.toLocaleString()+" · depth "+maxDepth;
+}
+function updateLegend(){
+  const size=colorMode==="size";
+  document.getElementById("barWrap").style.display=size?"":"none";
+  document.getElementById("cats").style.display=size?"none":"grid";
+  document.getElementById("legTitle").textContent=size?"branch color = file size":"branch color = file type";
+  if(size){
+    document.getElementById("barMin").textContent=fmtSize(Math.pow(10,vMin)-1);
+    document.getElementById("barMax").textContent=fmtSize(Math.pow(10,vMax)-1);
+  }else{
+    const c=document.getElementById("cats"); c.innerHTML="";
+    for(const k of ["folder","code","media","audio","doc","data","archive","other"]){
+      const s=document.createElement("span");
+      s.innerHTML='<i style="background:'+CAT[k]+'"></i>'+CAT_LABEL[k]; c.appendChild(s);
+    }
+  }
+}
+function applyQuery(){
+  if(!query){for(const n of nodes){n.match=false;n.subMatch=false;}return;}
+  for(const n of nodes){n.match=n.data.name.toLowerCase().includes(query);n.subMatch=false;}
+  for(const n of nodes){ if(!n.match)continue; let p=n.parent;
+    while(p&&!p.subMatch){p.subMatch=true;p=p.parent;} }
+}
+
+/* ---------- controls ---------- */
+document.getElementById("pick").addEventListener("click",()=>document.getElementById("dir").click());
+document.getElementById("dir").addEventListener("change",e=>{
+  const files=[]; for(const f of e.target.files) files.push({path:f.webkitRelativePath||f.name,size:f.size});
+  if(!files.length)return; collapsed.clear(); rootData=buildTree(files); resetView();
+});
+document.getElementById("demo").addEventListener("click",()=>{ collapsed.clear(); rootData=buildTree(demoFiles()); resetView(); });
+function resetView(){ cam={x:0,y:0,k:1}; layout(); autoZoom(); }
+function autoZoom(){ const maxDepth=nodes.reduce((m,n)=>Math.max(m,n.depth),0);
+  const R=Math.max(1,maxDepth)*RING_GAP*1.18; cam.k=Math.min(1.3,Math.min(innerWidth,innerHeight)/2/R); }
+
+function slider(id,out,fn){ const el=document.getElementById(id),o=document.getElementById(out);
+  el.addEventListener("input",()=>{o.textContent=el.value;fn(+el.value);}); }
+slider("rMag","oMag",v=>{params.mag=v;});
+slider("rR","oR",v=>{params.R=v;});
+slider("rDep","oDep",v=>{params.depth=v;layout();autoZoom();});
+document.getElementById("q").addEventListener("input",e=>{query=e.target.value.trim().toLowerCase();applyQuery();});
+document.getElementById("colorSeg").addEventListener("click",e=>{
+  const b=e.target.closest("button"); if(!b)return; colorMode=b.dataset.c;
+  for(const x of e.currentTarget.children)x.classList.toggle("on",x===b); updateLegend();
+});
+
+/* ---------- demo tree ---------- */
+function demoFiles(){
+  const out=[],rnd=(a,b)=>a+Math.random()*(b-a),push=(p,s)=>out.push({path:p,size:Math.round(s)});
+  const R="home",code=["rs","ts","tsx","py","toml","md"],projects=["archipelago","pharaoh","lattice","oracle","orbit-rack"];
+  for(const proj of projects){
+    push(`${R}/Code/${proj}/README.md`,rnd(2e3,9e3)); push(`${R}/Code/${proj}/Cargo.toml`,rnd(500,2e3));
+    const mods=["core","render","io","state","net","ui"].slice(0,3+Math.floor(rnd(0,4)));
+    for(const m of mods){ const nf=3+Math.floor(rnd(0,7));
+      for(let i=0;i<nf;i++){ const e=code[Math.floor(rnd(0,code.length))];
+        push(`${R}/Code/${proj}/src/${m}/${m}_${i}.${e}`,rnd(1e3,6e4));
+        if(Math.random()<0.6)push(`${R}/Code/${proj}/src/${m}/${m}_${i}.md`,rnd(800,4e3)); } }
+    push(`${R}/Code/${proj}/assets/icon.png`,rnd(1e4,2e5));
+    if(Math.random()<0.7)push(`${R}/Code/${proj}/data/world.json`,rnd(1e4,8e5));
+  }
+  for(let i=0;i<34;i++)push(`${R}/Music/vinyl-rips/side_${i}.flac`,rnd(2e7,9e7));
+  for(let i=0;i<18;i++)push(`${R}/Music/eurorack/patch_${i}.wav`,rnd(5e6,4e7));
+  for(let i=0;i<26;i++)push(`${R}/Photos/arboretum/2026-0${1+i%6}/IMG_${1000+i}.heic`,rnd(2e6,8e6));
+  for(let i=0;i<12;i++)push(`${R}/Photos/twins/IMG_${2000+i}.heic`,rnd(2e6,7e6));
+  for(let i=0;i<9;i++)push(`${R}/Documents/papers/paper_${i}.pdf`,rnd(4e5,6e6));
+  push(`${R}/Documents/vacuum-chamber/baseplate_v3.step`,4.2e6);
+  push(`${R}/Documents/vacuum-chamber/port-layout.pdf`,8e5);
+  for(let i=0;i<7;i++)push(`${R}/Models/checkpoints/ckpt_${i}.safetensors`,rnd(5e8,4e9));
+  push(`${R}/Downloads/omarchy.iso`,2.8e9);
+  for(let i=0;i<15;i++)push(`${R}/Downloads/misc_${i}.${["zip","pdf","png","csv","gz"][i%5]}`,rnd(1e4,5e7));
+  return out;
+}
+
+/* ---------- boot ---------- */
+resize();
+rootData=buildTree(demoFiles());
+layout(); autoZoom(); frame();
+</script>
+</body>
+</html>

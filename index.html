@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#090c11" />
+    <title>Fileogenetic Tree</title>
+  </head>
+  <body>
+    <canvas id="map" aria-label="Filesystem map"></canvas>
+
+    <aside class="panel">
+      <header>
+        <h1>fileo<span>/</span>genetic</h1>
+        <p>A living map of the files on this machine.</p>
+      </header>
+
+      <button class="primary" id="choose-folder">Index a folder</button>
+      <select id="roots" aria-label="Previously indexed folders">
+        <option value="">Previously indexed folders…</option>
+      </select>
+
+      <div id="indexing-activity" class="indexing-activity" hidden aria-live="polite">
+        <div class="dendrite-loader" aria-hidden="true">
+          <i></i><i></i><i></i><b></b>
+        </div>
+        <div class="indexing-copy">
+          <strong id="indexing-label">Discovering files…</strong>
+          <span id="indexing-detail">Preparing the map</span>
+        </div>
+        <div class="scan-track" aria-hidden="true"><i></i></div>
+      </div>
+
+      <div class="stats" aria-live="polite">
+        <span>files</span><strong id="stat-files">–</strong>
+        <span>folders</span><strong id="stat-folders">–</strong>
+        <span>total size</span><strong id="stat-size">–</strong>
+        <span>indexed</span><strong id="stat-indexed">–</strong>
+      </div>
+
+      <input id="search" type="search" placeholder="Search the index…" spellcheck="false" />
+      <div id="search-status" class="search-status">Index a folder to begin.</div>
+
+      <fieldset>
+        <legend>layout</legend>
+        <div class="segments" id="layout-controls">
+          <button class="active" data-layout="radial">radial</button>
+          <button data-layout="treemap">square</button>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>color</legend>
+        <div class="segments" id="color-controls">
+          <button class="active" data-color="size">size</button>
+          <button data-color="type">type</button>
+        </div>
+      </fieldset>
+
+      <label class="toggle">
+        <input id="size-nodes" type="checkbox" checked />
+        <span>size nodes by file size</span>
+      </label>
+
+      <div class="legend">
+        <span id="legend-title">color = file size</span>
+        <div id="size-gradient"></div>
+        <div id="type-legend" hidden></div>
+      </div>
+
+      <div id="status" class="status">Ready.</div>
+    </aside>
+
+    <div id="tooltip" class="tooltip" hidden></div>
+    <div class="hint">scroll to zoom · drag to pan · hover to inspect</div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
